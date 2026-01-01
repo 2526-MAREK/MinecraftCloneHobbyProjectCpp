@@ -1,0 +1,36 @@
+.vs/
+
+# Visual Studio build outputs
+dx11/bin/
+dx11/obj/
+bin/
+obj/
+out/
+
+# CMake build outputs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.cmake
+
+# MSVC intermediate files
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.tlog
+*.log
+*.res
+*.suo
+*.user
+*.opendb
+*.VC.db
+*.VC.opendb
+
+# Executables and libraries
+*.exe
+*.dll
+*.lib
+*.exp

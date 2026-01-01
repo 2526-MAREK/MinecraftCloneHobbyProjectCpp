@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -25,10 +26,20 @@ constexpr int kChunkSize = 16;
 constexpr int kChunkVolume = kChunkSize * kChunkSize * kChunkSize;
 constexpr int kGroundHeight = 2;
 constexpr float kBlockSize = 1.0f;
+constexpr int kAtlasTilesX = 4;
+constexpr int kAtlasTilesY = 1;
+constexpr int kAtlasTileSize = 8;
+constexpr int kAtlasWidth = kAtlasTilesX * kAtlasTileSize;
+constexpr int kAtlasHeight = kAtlasTilesY * kAtlasTileSize;
+constexpr int kTileGrassTop = 0;
+constexpr int kTileGrassSide = 1;
+constexpr int kTileDirt = 2;
+constexpr int kTileStone = 3;
 constexpr float kMoveSpeed = 6.0f;
 constexpr float kMouseSensitivity = 0.002f;
 constexpr float kMaxPitch = DirectX::XM_PIDIV2 - 0.01f;
 constexpr float kRaycastDistance = 8.0f;
+constexpr float kSelectionScale = 1.03f;
 
 using D3DCompileFn =
     HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
@@ -53,10 +64,17 @@ struct D3DState {
   Microsoft::WRL::ComPtr<ID3D11Buffer> vertex_buffer;
   Microsoft::WRL::ComPtr<ID3D11Buffer> constant_buffer;
   Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer_state;
+  Microsoft::WRL::ComPtr<ID3D11PixelShader> solid_pixel_shader;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> highlight_vertex_buffer;
+  Microsoft::WRL::ComPtr<ID3D11RasterizerState> wireframe_state;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> texture_srv;
+  Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_state;
   UINT vertex_stride = 0;
   UINT vertex_offset = 0;
   UINT vertex_count = 0;
   UINT vertex_buffer_size = 0;
+  UINT highlight_vertex_count = 0;
+  UINT highlight_vertex_buffer_size = 0;
 };
 
 struct CameraState {
@@ -70,6 +88,7 @@ struct CameraState {
 struct Vertex {
   DirectX::XMFLOAT3 position;
   DirectX::XMFLOAT4 color;
+  DirectX::XMFLOAT2 uv;
 };
 
 enum class BlockId : uint8_t {
@@ -159,6 +178,8 @@ struct VoxelChunk {
 
 std::vector<Vertex> BuildVoxelMesh(const VoxelChunk& chunk);
 bool UploadVoxelMesh(const std::vector<Vertex>& vertices);
+std::vector<Vertex> BuildSelectionMesh(const Int3& block);
+bool UploadSelectionMesh(const std::vector<Vertex>& vertices);
 
 D3DState g_d3d;
 VoxelChunk g_chunk;
@@ -358,6 +379,9 @@ struct RayHit {
   Int3 previous{0, 0, 0};
 };
 
+RayHit g_hover_hit;
+bool g_hover_valid = false;
+
 RayHit RaycastVoxel(const VoxelChunk& chunk, const DirectX::XMFLOAT3& origin,
                     const DirectX::XMFLOAT3& direction, float max_distance) {
   RayHit result;
@@ -467,6 +491,32 @@ RayHit RaycastVoxel(const VoxelChunk& chunk, const DirectX::XMFLOAT3& origin,
   return result;
 }
 
+void UpdateHoverHit() {
+  if (!g_mouse_captured) {
+    g_hover_valid = false;
+    return;
+  }
+
+  const DirectX::XMVECTOR forward_vec = GetCameraForward();
+  DirectX::XMFLOAT3 forward{};
+  DirectX::XMStoreFloat3(&forward, forward_vec);
+  const DirectX::XMFLOAT3 origin = g_camera.position;
+  const RayHit hit = RaycastVoxel(g_chunk, origin, forward, kRaycastDistance);
+  g_hover_valid = hit.hit;
+  if (g_hover_valid) {
+    g_hover_hit = hit;
+  }
+}
+
+void UpdateSelectionMesh() {
+  if (!g_hover_valid) {
+    g_d3d.highlight_vertex_count = 0;
+    return;
+  }
+  const std::vector<Vertex> vertices = BuildSelectionMesh(g_hover_hit.block);
+  UploadSelectionMesh(vertices);
+}
+
 bool HandleBlockInteraction() {
   const bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
   const bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
@@ -475,18 +525,10 @@ bool HandleBlockInteraction() {
   g_lmb_down = lmb;
   g_rmb_down = rmb;
 
-  if (!g_mouse_captured || (!lmb_pressed && !rmb_pressed)) {
+  if (!g_mouse_captured || !g_hover_valid || (!lmb_pressed && !rmb_pressed)) {
     return false;
   }
-
-  const DirectX::XMVECTOR forward_vec = GetCameraForward();
-  DirectX::XMFLOAT3 forward{};
-  DirectX::XMStoreFloat3(&forward, forward_vec);
-  const DirectX::XMFLOAT3 origin = g_camera.position;
-  const RayHit hit = RaycastVoxel(g_chunk, origin, forward, kRaycastDistance);
-  if (!hit.hit) {
-    return false;
-  }
+  const RayHit hit = g_hover_hit;
 
   bool changed = false;
   if (lmb_pressed) {
@@ -530,33 +572,51 @@ BlockId GetBlockSafe(const VoxelChunk& chunk, int x, int y, int z) {
   return chunk.Get(x, y, z);
 }
 
-DirectX::XMFLOAT4 BlockFaceColor(BlockId id, FaceDir dir) {
-  switch (id) {
-    case BlockId::Grass:
-      if (dir == FaceDir::PosY) {
-        return {0.35f, 0.70f, 0.35f, 1.0f};
-      }
-      if (dir == FaceDir::NegY) {
-        return {0.43f, 0.33f, 0.22f, 1.0f};
-      }
-      return {0.30f, 0.62f, 0.30f, 1.0f};
-    case BlockId::Dirt:
-      return {0.47f, 0.35f, 0.24f, 1.0f};
-    case BlockId::Stone:
-      return {0.55f, 0.55f, 0.55f, 1.0f};
-    case BlockId::Air:
-      break;
-  }
-  return {0.0f, 0.0f, 0.0f, 0.0f};
-}
-
 DirectX::XMFLOAT4 ApplyShade(const DirectX::XMFLOAT4& color, float shade) {
   return {color.x * shade, color.y * shade, color.z * shade, color.w};
 }
 
+int GetTileIndex(BlockId id, FaceDir dir) {
+  switch (id) {
+    case BlockId::Grass:
+      if (dir == FaceDir::PosY) {
+        return kTileGrassTop;
+      }
+      if (dir == FaceDir::NegY) {
+        return kTileDirt;
+      }
+      return kTileGrassSide;
+    case BlockId::Dirt:
+      return kTileDirt;
+    case BlockId::Stone:
+      return kTileStone;
+    case BlockId::Air:
+      break;
+  }
+  return kTileDirt;
+}
+
+std::array<DirectX::XMFLOAT2, 4> GetTileUVs(int tile_index) {
+  const float tile_w = 1.0f / static_cast<float>(kAtlasTilesX);
+  const float tile_h = 1.0f / static_cast<float>(kAtlasTilesY);
+  const int tile_x = tile_index % kAtlasTilesX;
+  const int tile_y = tile_index / kAtlasTilesX;
+  const float u0 = tile_x * tile_w;
+  const float v0 = tile_y * tile_h;
+  const float u1 = u0 + tile_w;
+  const float v1 = v0 + tile_h;
+  return {{
+      {u0, v0},
+      {u1, v0},
+      {u1, v1},
+      {u0, v1},
+  }};
+}
+
 void AddFace(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
-             const FaceDef& face, const DirectX::XMFLOAT4& color) {
+             const FaceDef& face, const DirectX::XMFLOAT4& color, int tile_index) {
   constexpr int indices[6] = {0, 1, 2, 0, 2, 3};
+  const std::array<DirectX::XMFLOAT2, 4> uvs = GetTileUVs(tile_index);
   for (int i = 0; i < 6; ++i) {
     const int idx = indices[i];
     const DirectX::XMFLOAT3& corner = face.corners[static_cast<size_t>(idx)];
@@ -567,6 +627,28 @@ void AddFace(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
         base.z + corner.z * kBlockSize,
     };
     vertex.color = color;
+    vertex.uv = uvs[static_cast<size_t>(idx)];
+    vertices.push_back(vertex);
+  }
+}
+
+void AddFaceScaled(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
+                   float scale, const FaceDef& face,
+                   const DirectX::XMFLOAT4& color, int tile_index) {
+  constexpr int indices[6] = {0, 1, 2, 0, 2, 3};
+  const std::array<DirectX::XMFLOAT2, 4> uvs = GetTileUVs(tile_index);
+  const float size = kBlockSize * scale;
+  for (int i = 0; i < 6; ++i) {
+    const int idx = indices[i];
+    const DirectX::XMFLOAT3& corner = face.corners[static_cast<size_t>(idx)];
+    Vertex vertex;
+    vertex.position = {
+        base.x + corner.x * size,
+        base.y + corner.y * size,
+        base.z + corner.z * size,
+    };
+    vertex.color = color;
+    vertex.uv = uvs[static_cast<size_t>(idx)];
     vertices.push_back(vertex);
   }
 }
@@ -594,12 +676,31 @@ std::vector<Vertex> BuildVoxelMesh(const VoxelChunk& chunk) {
               y * kBlockSize,
               (z * kBlockSize) - half,
           };
-          const DirectX::XMFLOAT4 base_color = BlockFaceColor(id, face.dir);
+          const DirectX::XMFLOAT4 base_color{1.0f, 1.0f, 1.0f, 1.0f};
           const DirectX::XMFLOAT4 shaded = ApplyShade(base_color, face.shade);
-          AddFace(vertices, base, face, shaded);
+          const int tile_index = GetTileIndex(id, face.dir);
+          AddFace(vertices, base, face, shaded, tile_index);
         }
       }
     }
+  }
+  return vertices;
+}
+
+std::vector<Vertex> BuildSelectionMesh(const Int3& block) {
+  std::vector<Vertex> vertices;
+  vertices.reserve(36u);
+  const float half = 0.5f * kChunkSize * kBlockSize;
+  const float expand = (kSelectionScale - 1.0f) * 0.5f * kBlockSize;
+  const DirectX::XMFLOAT3 base{
+      (block.x * kBlockSize) - half - expand,
+      (block.y * kBlockSize) - expand,
+      (block.z * kBlockSize) - half - expand,
+  };
+  const DirectX::XMFLOAT4 highlight{1.0f, 1.0f, 0.2f, 1.0f};
+  for (const auto& face : kFaces) {
+    const DirectX::XMFLOAT4 shaded = ApplyShade(highlight, face.shade);
+    AddFaceScaled(vertices, base, kSelectionScale, face, shaded, kTileGrassTop);
   }
   return vertices;
 }
@@ -642,6 +743,157 @@ bool UploadVoxelMesh(const std::vector<Vertex>& vertices) {
   return true;
 }
 
+bool UploadSelectionMesh(const std::vector<Vertex>& vertices) {
+  if (!g_d3d.device || !g_d3d.context) {
+    return false;
+  }
+  if (vertices.empty()) {
+    g_d3d.highlight_vertex_count = 0;
+    return true;
+  }
+  g_d3d.highlight_vertex_count = static_cast<UINT>(vertices.size());
+  const UINT byte_size = g_d3d.highlight_vertex_count * sizeof(Vertex);
+  if (!g_d3d.highlight_vertex_buffer ||
+      byte_size > g_d3d.highlight_vertex_buffer_size) {
+    g_d3d.highlight_vertex_buffer.Reset();
+    D3D11_BUFFER_DESC buffer_desc{};
+    buffer_desc.ByteWidth = byte_size;
+    buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+    buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    HRESULT hr = g_d3d.device->CreateBuffer(&buffer_desc, nullptr,
+                                            &g_d3d.highlight_vertex_buffer);
+    if (FAILED(hr)) {
+      ShowError("Failed to create selection vertex buffer", hr);
+      return false;
+    }
+    g_d3d.highlight_vertex_buffer_size = byte_size;
+  }
+
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  HRESULT hr = g_d3d.context->Map(g_d3d.highlight_vertex_buffer.Get(), 0,
+                                  D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  if (FAILED(hr)) {
+    ShowError("Failed to map selection vertex buffer", hr);
+    return false;
+  }
+  std::memcpy(mapped.pData, vertices.data(), byte_size);
+  g_d3d.context->Unmap(g_d3d.highlight_vertex_buffer.Get(), 0);
+  return true;
+}
+
+bool CreateTextureAtlas() {
+  if (!g_d3d.device) {
+    return false;
+  }
+
+  std::vector<uint8_t> pixels(static_cast<size_t>(kAtlasWidth) *
+                              static_cast<size_t>(kAtlasHeight) * 4u);
+  auto set_pixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b,
+                       uint8_t a = 255) {
+    const int index = (y * kAtlasWidth + x) * 4;
+    pixels[static_cast<size_t>(index) + 0] = r;
+    pixels[static_cast<size_t>(index) + 1] = g;
+    pixels[static_cast<size_t>(index) + 2] = b;
+    pixels[static_cast<size_t>(index) + 3] = a;
+  };
+
+  auto set_tile_pixel = [&](int tile_index, int x, int y, uint8_t r, uint8_t g,
+                            uint8_t b) {
+    const int tile_x = tile_index % kAtlasTilesX;
+    const int tile_y = tile_index / kAtlasTilesX;
+    const int px = tile_x * kAtlasTileSize + x;
+    const int py = tile_y * kAtlasTileSize + y;
+    set_pixel(px, py, r, g, b, 255);
+  };
+
+  for (int y = 0; y < kAtlasTileSize; ++y) {
+    for (int x = 0; x < kAtlasTileSize; ++x) {
+      const bool speckle = ((x + y) % 5) == 0;
+      const uint8_t g = speckle ? 160 : 180;
+      set_tile_pixel(kTileGrassTop, x, y, 70, g, 70);
+    }
+  }
+
+  for (int y = 0; y < kAtlasTileSize; ++y) {
+    for (int x = 0; x < kAtlasTileSize; ++x) {
+      if (y < 2) {
+        set_tile_pixel(kTileGrassSide, x, y, 70, 180, 70);
+      } else {
+        set_tile_pixel(kTileGrassSide, x, y, 120, 90, 60);
+      }
+    }
+  }
+
+  for (int y = 0; y < kAtlasTileSize; ++y) {
+    for (int x = 0; x < kAtlasTileSize; ++x) {
+      const bool speckle = ((x * 3 + y * 7) % 9) == 0;
+      const uint8_t r = speckle ? 140 : 120;
+      const uint8_t g = speckle ? 110 : 90;
+      const uint8_t b = speckle ? 80 : 60;
+      set_tile_pixel(kTileDirt, x, y, r, g, b);
+    }
+  }
+
+  for (int y = 0; y < kAtlasTileSize; ++y) {
+    for (int x = 0; x < kAtlasTileSize; ++x) {
+      const bool speckle = ((x * 5 + y * 11) % 13) == 0;
+      const uint8_t c = speckle ? 160 : 130;
+      set_tile_pixel(kTileStone, x, y, c, c, c);
+    }
+  }
+
+  D3D11_TEXTURE2D_DESC desc{};
+  desc.Width = kAtlasWidth;
+  desc.Height = kAtlasHeight;
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_IMMUTABLE;
+  desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+  D3D11_SUBRESOURCE_DATA init_data{};
+  init_data.pSysMem = pixels.data();
+  init_data.SysMemPitch = kAtlasWidth * 4;
+
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+  HRESULT hr = g_d3d.device->CreateTexture2D(&desc, &init_data, &texture);
+  if (FAILED(hr)) {
+    ShowError("Failed to create texture atlas", hr);
+    return false;
+  }
+
+  D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+  srv_desc.Format = desc.Format;
+  srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+  srv_desc.Texture2D.MipLevels = 1;
+
+  hr = g_d3d.device->CreateShaderResourceView(texture.Get(), &srv_desc,
+                                              &g_d3d.texture_srv);
+  if (FAILED(hr)) {
+    ShowError("Failed to create texture SRV", hr);
+    return false;
+  }
+
+  D3D11_SAMPLER_DESC sampler_desc{};
+  sampler_desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sampler_desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampler_desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  sampler_desc.MinLOD = 0.0f;
+  sampler_desc.MaxLOD = D3D11_FLOAT32_MAX;
+
+  hr = g_d3d.device->CreateSamplerState(&sampler_desc, &g_d3d.sampler_state);
+  if (FAILED(hr)) {
+    ShowError("Failed to create sampler state", hr);
+    return false;
+  }
+
+  return true;
+}
+
 bool CompileShader(const char* source, const char* entry, const char* target,
                    Microsoft::WRL::ComPtr<ID3DBlob>& shader_blob) {
   if (!LoadD3DCompiler()) {
@@ -675,26 +927,32 @@ bool CreatePipeline() {
     struct VSInput {
       float3 position : POSITION;
       float4 color : COLOR;
+      float2 uv : TEXCOORD0;
     };
     struct VSOutput {
       float4 position : SV_POSITION;
       float4 color : COLOR;
+      float2 uv : TEXCOORD0;
     };
     VSOutput main(VSInput input) {
       VSOutput output;
       output.position = mul(float4(input.position, 1.0f), mvp);
       output.color = input.color;
+      output.uv = input.uv;
       return output;
     }
   )";
 
   const char* ps_source = R"(
+    Texture2D atlas : register(t0);
+    SamplerState atlasSampler : register(s0);
     struct PSInput {
       float4 position : SV_POSITION;
       float4 color : COLOR;
+      float2 uv : TEXCOORD0;
     };
     float4 main(PSInput input) : SV_TARGET {
-      return input.color;
+      return atlas.Sample(atlasSampler, input.uv) * input.color;
     }
   )";
 
@@ -722,11 +980,38 @@ bool CreatePipeline() {
     return false;
   }
 
+  const char* solid_ps_source = R"(
+    struct PSInput {
+      float4 position : SV_POSITION;
+      float4 color : COLOR;
+      float2 uv : TEXCOORD0;
+    };
+    float4 main(PSInput input) : SV_TARGET {
+      return input.color;
+    }
+  )";
+
+  Microsoft::WRL::ComPtr<ID3DBlob> solid_ps_blob;
+  if (!CompileShader(solid_ps_source, "main", "ps_5_0", solid_ps_blob)) {
+    return false;
+  }
+  hr = g_d3d.device->CreatePixelShader(
+      solid_ps_blob->GetBufferPointer(), solid_ps_blob->GetBufferSize(), nullptr,
+      &g_d3d.solid_pixel_shader);
+  if (FAILED(hr)) {
+    ShowError("Failed to create solid pixel shader", hr);
+    return false;
+  }
+
   const D3D11_INPUT_ELEMENT_DESC layout[] = {
-      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
+       static_cast<UINT>(offsetof(Vertex, position)),
        D3D11_INPUT_PER_VERTEX_DATA, 0},
-      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
+      {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
+       static_cast<UINT>(offsetof(Vertex, color)),
        D3D11_INPUT_PER_VERTEX_DATA, 0},
+      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,
+       static_cast<UINT>(offsetof(Vertex, uv)), D3D11_INPUT_PER_VERTEX_DATA, 0},
   };
   hr = g_d3d.device->CreateInputLayout(
       layout, static_cast<UINT>(sizeof(layout) / sizeof(layout[0])),
@@ -756,6 +1041,20 @@ bool CreatePipeline() {
                                            &g_d3d.rasterizer_state);
   if (FAILED(hr)) {
     ShowError("Failed to create rasterizer state", hr);
+    return false;
+  }
+
+  D3D11_RASTERIZER_DESC wire_desc = raster_desc;
+  wire_desc.FillMode = D3D11_FILL_WIREFRAME;
+  wire_desc.CullMode = D3D11_CULL_NONE;
+  hr = g_d3d.device->CreateRasterizerState(&wire_desc,
+                                           &g_d3d.wireframe_state);
+  if (FAILED(hr)) {
+    ShowError("Failed to create wireframe rasterizer state", hr);
+    return false;
+  }
+
+  if (!CreateTextureAtlas()) {
     return false;
   }
 
@@ -893,7 +1192,8 @@ void Render() {
                                          1.0f, 0);
   }
   if (g_d3d.vertex_shader && g_d3d.pixel_shader && g_d3d.input_layout &&
-      g_d3d.vertex_buffer && g_d3d.constant_buffer && g_d3d.vertex_count > 0) {
+      g_d3d.vertex_buffer && g_d3d.constant_buffer && g_d3d.texture_srv &&
+      g_d3d.sampler_state && g_d3d.vertex_count > 0) {
     const float aspect =
         (g_d3d.height == 0) ? 1.0f
                             : static_cast<float>(g_d3d.width) /
@@ -920,8 +1220,24 @@ void Render() {
     g_d3d.context->VSSetShader(g_d3d.vertex_shader.Get(), nullptr, 0);
     g_d3d.context->VSSetConstantBuffers(0, 1, g_d3d.constant_buffer.GetAddressOf());
     g_d3d.context->PSSetShader(g_d3d.pixel_shader.Get(), nullptr, 0);
+    g_d3d.context->PSSetShaderResources(0, 1, g_d3d.texture_srv.GetAddressOf());
+    g_d3d.context->PSSetSamplers(0, 1, g_d3d.sampler_state.GetAddressOf());
     g_d3d.context->RSSetState(g_d3d.rasterizer_state.Get());
     g_d3d.context->Draw(g_d3d.vertex_count, 0);
+  }
+  if (g_d3d.wireframe_state && g_d3d.solid_pixel_shader &&
+      g_d3d.highlight_vertex_buffer && g_d3d.highlight_vertex_count > 0) {
+    g_d3d.context->IASetInputLayout(g_d3d.input_layout.Get());
+    g_d3d.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_d3d.context->IASetVertexBuffers(
+        0, 1, g_d3d.highlight_vertex_buffer.GetAddressOf(), &g_d3d.vertex_stride,
+        &g_d3d.vertex_offset);
+    g_d3d.context->VSSetShader(g_d3d.vertex_shader.Get(), nullptr, 0);
+    g_d3d.context->VSSetConstantBuffers(0, 1,
+                                        g_d3d.constant_buffer.GetAddressOf());
+    g_d3d.context->PSSetShader(g_d3d.solid_pixel_shader.Get(), nullptr, 0);
+    g_d3d.context->RSSetState(g_d3d.wireframe_state.Get());
+    g_d3d.context->Draw(g_d3d.highlight_vertex_count, 0);
   }
   g_d3d.swap_chain->Present(1, 0);
 }
@@ -1014,7 +1330,12 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR,
         dt = 0.1f;
       }
       UpdateInput(dt);
-      HandleBlockInteraction();
+      UpdateHoverHit();
+      const bool changed = HandleBlockInteraction();
+      if (changed) {
+        UpdateHoverHit();
+      }
+      UpdateSelectionMesh();
       Render();
     }
   }

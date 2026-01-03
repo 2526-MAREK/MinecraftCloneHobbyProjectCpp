@@ -17,12 +17,14 @@ DirectX 11 (native .sln):
 3. Run (F5).
 
 ## Current DX11 Features
-- Chunked voxel mesh (single 16x16x16 chunk with flat ground).
-- Face-culling mesh generation.
-- Texture atlas generated in code + per-face UVs.
+- Chunk streaming around the camera (multiple 16x16x16 chunks).
+- Face-culling mesh generation with cross-chunk neighbor checks.
+- Per-chunk frustum culling.
+- Texture atlas loaded from `dx11/assets/atlas.ppm` + per-face UVs.
 - FPS camera (WASD + mouse, Space/Shift up/down, Ctrl speed).
 - Block break/place with LMB/RMB.
 - Hover highlight (wireframe selection box).
+- Crosshair + basic HUD (FPS, position, block ID).
 
 ## Key Files (DX11)
 - `dx11/src/main.cpp`: all DX11 rendering, input, voxel logic, and shaders.
@@ -30,12 +32,11 @@ DirectX 11 (native .sln):
 - `dx11/MinecraftCloneDX11.vcxproj`: project settings.
 
 ## Next Steps (Suggested)
-1. Load textures from file instead of in-code atlas (e.g. PNG + WIC loader).
-2. Add chunk streaming (multiple chunks, world origin, frustum culling).
-3. Separate systems into modules (renderer, world, input, camera).
-4. Implement greedy meshing for fewer triangles.
-5. Add collision, gravity, and basic player controller.
-6. Add UI overlay (crosshair, FPS, block type).
+1. Load textures from file via PNG + WIC (replace PPM loader).
+2. Separate systems into modules (renderer, world, input, camera).
+3. Implement greedy meshing for fewer triangles.
+4. Add collision, gravity, and basic player controller.
+5. Add chunk LOD or async generation for larger worlds.
 
 ## Guidelines for Changes
 - Keep DX11 prototype self-contained under `dx11/`.

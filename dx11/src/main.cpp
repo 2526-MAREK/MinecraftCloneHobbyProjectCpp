@@ -9,12 +9,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -28,9 +33,6 @@ constexpr int kGroundHeight = 2;
 constexpr float kBlockSize = 1.0f;
 constexpr int kAtlasTilesX = 4;
 constexpr int kAtlasTilesY = 1;
-constexpr int kAtlasTileSize = 8;
-constexpr int kAtlasWidth = kAtlasTilesX * kAtlasTileSize;
-constexpr int kAtlasHeight = kAtlasTilesY * kAtlasTileSize;
 constexpr int kTileGrassTop = 0;
 constexpr int kTileGrassSide = 1;
 constexpr int kTileDirt = 2;
@@ -45,6 +47,9 @@ constexpr float kHudPadding = 12.0f;
 constexpr float kCrosshairLength = 10.0f;
 constexpr float kCrosshairGap = 6.0f;
 constexpr float kCrosshairThickness = 2.0f;
+constexpr int kWorldRadiusChunks = 3;
+constexpr int kWorldMinChunkY = 0;
+constexpr int kWorldMaxChunkY = 0;
 
 using D3DCompileFn =
     HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
@@ -66,7 +71,6 @@ struct D3DState {
   Microsoft::WRL::ComPtr<ID3D11VertexShader> vertex_shader;
   Microsoft::WRL::ComPtr<ID3D11PixelShader> pixel_shader;
   Microsoft::WRL::ComPtr<ID3D11InputLayout> input_layout;
-  Microsoft::WRL::ComPtr<ID3D11Buffer> vertex_buffer;
   Microsoft::WRL::ComPtr<ID3D11Buffer> constant_buffer;
   Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer_state;
   Microsoft::WRL::ComPtr<ID3D11PixelShader> solid_pixel_shader;
@@ -79,8 +83,6 @@ struct D3DState {
   Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_state;
   UINT vertex_stride = 0;
   UINT vertex_offset = 0;
-  UINT vertex_count = 0;
-  UINT vertex_buffer_size = 0;
   UINT highlight_vertex_count = 0;
   UINT highlight_vertex_buffer_size = 0;
   UINT hud_vertex_count = 0;
@@ -112,6 +114,19 @@ struct Int3 {
   int x;
   int y;
   int z;
+};
+
+bool operator==(const Int3& lhs, const Int3& rhs) {
+  return lhs.x == rhs.x && lhs.y == rhs.y && lhs.z == rhs.z;
+}
+
+struct Int3Hash {
+  size_t operator()(const Int3& value) const noexcept {
+    const size_t hx = static_cast<size_t>(value.x) * 73856093u;
+    const size_t hy = static_cast<size_t>(value.y) * 19349663u;
+    const size_t hz = static_cast<size_t>(value.z) * 83492791u;
+    return hx ^ hy ^ hz;
+  }
 };
 
 enum class FaceDir {
@@ -186,16 +201,29 @@ struct VoxelChunk {
   }
 };
 
-std::vector<Vertex> BuildVoxelMesh(const VoxelChunk& chunk);
-bool UploadVoxelMesh(const std::vector<Vertex>& vertices);
+struct Chunk {
+  Int3 coord{0, 0, 0};
+  VoxelChunk voxels;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> vertex_buffer;
+  UINT vertex_count = 0;
+  UINT vertex_buffer_size = 0;
+  bool dirty = true;
+};
+
+struct World {
+  std::unordered_map<Int3, Chunk, Int3Hash> chunks;
+};
+
+std::vector<Vertex> BuildVoxelMesh(const World& world, const Chunk& chunk);
+bool UploadChunkMesh(Chunk& chunk, const std::vector<Vertex>& vertices);
 std::vector<Vertex> BuildSelectionMesh(const Int3& block);
 bool UploadSelectionMesh(const std::vector<Vertex>& vertices);
 std::vector<Vertex> BuildHudMesh();
 bool UploadHudMesh(const std::vector<Vertex>& vertices);
 
 D3DState g_d3d;
-VoxelChunk g_chunk;
-CameraState g_camera = {{0.0f, 6.0f, -14.0f}, 0.0f, 0.0f, kMoveSpeed,
+World g_world;
+CameraState g_camera = {{8.0f, 6.0f, -14.0f}, 0.0f, 0.0f, kMoveSpeed,
                          kMouseSensitivity};
 bool g_mouse_captured = false;
 bool g_escape_down = false;
@@ -382,19 +410,107 @@ void UpdateInput(float dt) {
   }
 }
 
-bool InBounds(int x, int y, int z) {
-  return x >= 0 && x < kChunkSize && y >= 0 && y < kChunkSize && z >= 0 &&
-         z < kChunkSize;
+int FloorDiv(int value, int divisor) {
+  int quotient = value / divisor;
+  int remainder = value % divisor;
+  if (remainder != 0 && ((remainder < 0) != (divisor < 0))) {
+    --quotient;
+  }
+  return quotient;
 }
 
-bool SetBlockInChunk(VoxelChunk& chunk, int x, int y, int z, BlockId id) {
-  if (!InBounds(x, y, z)) {
+int Mod(int value, int divisor) {
+  int result = value % divisor;
+  if (result < 0) {
+    result += divisor;
+  }
+  return result;
+}
+
+Int3 WorldToChunkCoord(int x, int y, int z) {
+  return {FloorDiv(x, kChunkSize), FloorDiv(y, kChunkSize),
+          FloorDiv(z, kChunkSize)};
+}
+
+Int3 WorldToLocalCoord(int x, int y, int z) {
+  return {Mod(x, kChunkSize), Mod(y, kChunkSize), Mod(z, kChunkSize)};
+}
+
+Int3 WorldBlockFromPosition(const DirectX::XMFLOAT3& position) {
+  return {static_cast<int>(std::floor(position.x)),
+          static_cast<int>(std::floor(position.y)),
+          static_cast<int>(std::floor(position.z))};
+}
+
+Chunk* FindChunk(World& world, const Int3& coord) {
+  auto it = world.chunks.find(coord);
+  if (it == world.chunks.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+const Chunk* FindChunk(const World& world, const Int3& coord) {
+  auto it = world.chunks.find(coord);
+  if (it == world.chunks.end()) {
+    return nullptr;
+  }
+  return &it->second;
+}
+
+void MarkChunkDirty(World& world, const Int3& coord) {
+  Chunk* chunk = FindChunk(world, coord);
+  if (chunk) {
+    chunk->dirty = true;
+  }
+}
+
+void MarkNeighborChunksDirty(World& world, const Int3& coord) {
+  MarkChunkDirty(world, {coord.x + 1, coord.y, coord.z});
+  MarkChunkDirty(world, {coord.x - 1, coord.y, coord.z});
+  MarkChunkDirty(world, {coord.x, coord.y + 1, coord.z});
+  MarkChunkDirty(world, {coord.x, coord.y - 1, coord.z});
+  MarkChunkDirty(world, {coord.x, coord.y, coord.z + 1});
+  MarkChunkDirty(world, {coord.x, coord.y, coord.z - 1});
+}
+
+BlockId GetBlock(const World& world, int x, int y, int z) {
+  const Int3 chunk_coord = WorldToChunkCoord(x, y, z);
+  const Chunk* chunk = FindChunk(world, chunk_coord);
+  if (!chunk) {
+    return BlockId::Air;
+  }
+  const Int3 local = WorldToLocalCoord(x, y, z);
+  return chunk->voxels.Get(local.x, local.y, local.z);
+}
+
+bool SetBlock(World& world, int x, int y, int z, BlockId id) {
+  const Int3 chunk_coord = WorldToChunkCoord(x, y, z);
+  Chunk* chunk = FindChunk(world, chunk_coord);
+  if (!chunk) {
     return false;
   }
-  if (chunk.Get(x, y, z) == id) {
+  const Int3 local = WorldToLocalCoord(x, y, z);
+  if (chunk->voxels.Get(local.x, local.y, local.z) == id) {
     return false;
   }
-  chunk.Set(x, y, z, id);
+  chunk->voxels.Set(local.x, local.y, local.z, id);
+  chunk->dirty = true;
+  if (local.x == 0) {
+    MarkChunkDirty(world, {chunk_coord.x - 1, chunk_coord.y, chunk_coord.z});
+  } else if (local.x == kChunkSize - 1) {
+    MarkChunkDirty(world, {chunk_coord.x + 1, chunk_coord.y, chunk_coord.z});
+  }
+  if (local.y == 0) {
+    MarkChunkDirty(world, {chunk_coord.x, chunk_coord.y - 1, chunk_coord.z});
+  } else if (local.y == kChunkSize - 1) {
+    MarkChunkDirty(world, {chunk_coord.x, chunk_coord.y + 1, chunk_coord.z});
+  }
+  if (local.z == 0) {
+    MarkChunkDirty(world, {chunk_coord.x, chunk_coord.y, chunk_coord.z - 1});
+  } else if (local.z == kChunkSize - 1) {
+    MarkChunkDirty(world, {chunk_coord.x, chunk_coord.y, chunk_coord.z + 1});
+  }
   return true;
 }
 
@@ -407,7 +523,7 @@ struct RayHit {
 RayHit g_hover_hit;
 bool g_hover_valid = false;
 
-RayHit RaycastVoxel(const VoxelChunk& chunk, const DirectX::XMFLOAT3& origin,
+RayHit RaycastVoxel(const World& world, const DirectX::XMFLOAT3& origin,
                     const DirectX::XMFLOAT3& direction, float max_distance) {
   RayHit result;
 
@@ -422,10 +538,9 @@ RayHit RaycastVoxel(const VoxelChunk& chunk, const DirectX::XMFLOAT3& origin,
   dy /= len;
   dz /= len;
 
-  const float half = 0.5f * kChunkSize * kBlockSize;
-  const float ox = origin.x + half;
+  const float ox = origin.x;
   const float oy = origin.y;
-  const float oz = origin.z + half;
+  const float oz = origin.z;
 
   int x = static_cast<int>(std::floor(ox));
   int y = static_cast<int>(std::floor(oy));
@@ -464,8 +579,7 @@ RayHit RaycastVoxel(const VoxelChunk& chunk, const DirectX::XMFLOAT3& origin,
     t_delta_z = 1.0f / std::abs(dz);
   }
 
-  if (InBounds(current.x, current.y, current.z) &&
-      chunk.Get(current.x, current.y, current.z) != BlockId::Air) {
+  if (GetBlock(world, current.x, current.y, current.z) != BlockId::Air) {
     result.hit = true;
     result.block = current;
     result.previous = current;
@@ -504,8 +618,7 @@ RayHit RaycastVoxel(const VoxelChunk& chunk, const DirectX::XMFLOAT3& origin,
       break;
     }
 
-    if (InBounds(current.x, current.y, current.z) &&
-        chunk.Get(current.x, current.y, current.z) != BlockId::Air) {
+    if (GetBlock(world, current.x, current.y, current.z) != BlockId::Air) {
       result.hit = true;
       result.block = current;
       result.previous = previous;
@@ -526,7 +639,7 @@ void UpdateHoverHit() {
   DirectX::XMFLOAT3 forward{};
   DirectX::XMStoreFloat3(&forward, forward_vec);
   const DirectX::XMFLOAT3 origin = g_camera.position;
-  const RayHit hit = RaycastVoxel(g_chunk, origin, forward, kRaycastDistance);
+  const RayHit hit = RaycastVoxel(g_world, origin, forward, kRaycastDistance);
   g_hover_valid = hit.hit;
   if (g_hover_valid) {
     g_hover_hit = hit;
@@ -557,22 +670,16 @@ bool HandleBlockInteraction() {
 
   bool changed = false;
   if (lmb_pressed) {
-    changed = SetBlockInChunk(g_chunk, hit.block.x, hit.block.y, hit.block.z,
-                              BlockId::Air);
+    changed =
+        SetBlock(g_world, hit.block.x, hit.block.y, hit.block.z, BlockId::Air);
   }
   if (rmb_pressed) {
-    if (InBounds(hit.previous.x, hit.previous.y, hit.previous.z) &&
-        g_chunk.Get(hit.previous.x, hit.previous.y, hit.previous.z) ==
-            BlockId::Air) {
-      changed = SetBlockInChunk(g_chunk, hit.previous.x, hit.previous.y,
-                                hit.previous.z, BlockId::Dirt) ||
+    if (GetBlock(g_world, hit.previous.x, hit.previous.y, hit.previous.z) ==
+        BlockId::Air) {
+      changed = SetBlock(g_world, hit.previous.x, hit.previous.y,
+                         hit.previous.z, BlockId::Dirt) ||
                 changed;
     }
-  }
-
-  if (changed) {
-    const std::vector<Vertex> vertices = BuildVoxelMesh(g_chunk);
-    UploadVoxelMesh(vertices);
   }
 
   return changed;
@@ -589,12 +696,144 @@ void GenerateFlatChunk(VoxelChunk& chunk) {
   }
 }
 
-BlockId GetBlockSafe(const VoxelChunk& chunk, int x, int y, int z) {
-  if (x < 0 || x >= kChunkSize || y < 0 || y >= kChunkSize || z < 0 ||
-      z >= kChunkSize) {
-    return BlockId::Air;
+Chunk& GetOrCreateChunk(World& world, const Int3& coord) {
+  auto it = world.chunks.find(coord);
+  if (it != world.chunks.end()) {
+    return it->second;
   }
-  return chunk.Get(x, y, z);
+  Chunk chunk;
+  chunk.coord = coord;
+  GenerateFlatChunk(chunk.voxels);
+  chunk.dirty = true;
+  auto inserted = world.chunks.emplace(coord, std::move(chunk));
+  MarkNeighborChunksDirty(world, coord);
+  return inserted.first->second;
+}
+
+void RemoveChunk(World& world, const Int3& coord) {
+  auto it = world.chunks.find(coord);
+  if (it == world.chunks.end()) {
+    return;
+  }
+  MarkNeighborChunksDirty(world, coord);
+  world.chunks.erase(it);
+}
+
+void StreamChunks() {
+  const Int3 camera_block = WorldBlockFromPosition(g_camera.position);
+  const Int3 center = WorldToChunkCoord(camera_block.x, camera_block.y,
+                                        camera_block.z);
+
+  for (int cy = kWorldMinChunkY; cy <= kWorldMaxChunkY; ++cy) {
+    for (int dz = -kWorldRadiusChunks; dz <= kWorldRadiusChunks; ++dz) {
+      for (int dx = -kWorldRadiusChunks; dx <= kWorldRadiusChunks; ++dx) {
+        const Int3 coord{center.x + dx, cy, center.z + dz};
+        GetOrCreateChunk(g_world, coord);
+      }
+    }
+  }
+
+  std::vector<Int3> to_remove;
+  for (const auto& entry : g_world.chunks) {
+    const Int3& coord = entry.first;
+    if (coord.x < center.x - kWorldRadiusChunks ||
+        coord.x > center.x + kWorldRadiusChunks ||
+        coord.z < center.z - kWorldRadiusChunks ||
+        coord.z > center.z + kWorldRadiusChunks ||
+        coord.y < kWorldMinChunkY || coord.y > kWorldMaxChunkY) {
+      to_remove.push_back(coord);
+    }
+  }
+  for (const Int3& coord : to_remove) {
+    RemoveChunk(g_world, coord);
+  }
+}
+
+bool UpdateChunkMeshes() {
+  for (auto& entry : g_world.chunks) {
+    Chunk& chunk = entry.second;
+    if (!chunk.dirty) {
+      continue;
+    }
+    const std::vector<Vertex> vertices = BuildVoxelMesh(g_world, chunk);
+    if (!UploadChunkMesh(chunk, vertices)) {
+      return false;
+    }
+    chunk.dirty = false;
+  }
+  return true;
+}
+
+bool IsAabbVisible(const DirectX::XMMATRIX& view_proj,
+                   const DirectX::XMFLOAT3& min_point,
+                   const DirectX::XMFLOAT3& max_point) {
+  DirectX::XMFLOAT3 corners[8] = {
+      {min_point.x, min_point.y, min_point.z},
+      {max_point.x, min_point.y, min_point.z},
+      {min_point.x, max_point.y, min_point.z},
+      {max_point.x, max_point.y, min_point.z},
+      {min_point.x, min_point.y, max_point.z},
+      {max_point.x, min_point.y, max_point.z},
+      {min_point.x, max_point.y, max_point.z},
+      {max_point.x, max_point.y, max_point.z},
+  };
+
+  int outside_left = 0;
+  int outside_right = 0;
+  int outside_bottom = 0;
+  int outside_top = 0;
+  int outside_near = 0;
+  int outside_far = 0;
+
+  for (const auto& corner : corners) {
+    const DirectX::XMVECTOR pos =
+        DirectX::XMVectorSet(corner.x, corner.y, corner.z, 1.0f);
+    const DirectX::XMVECTOR clip = DirectX::XMVector4Transform(pos, view_proj);
+    const float cx = DirectX::XMVectorGetX(clip);
+    const float cy = DirectX::XMVectorGetY(clip);
+    const float cz = DirectX::XMVectorGetZ(clip);
+    const float cw = DirectX::XMVectorGetW(clip);
+
+    if (cx < -cw) {
+      ++outside_left;
+    }
+    if (cx > cw) {
+      ++outside_right;
+    }
+    if (cy < -cw) {
+      ++outside_bottom;
+    }
+    if (cy > cw) {
+      ++outside_top;
+    }
+    if (cz < 0.0f) {
+      ++outside_near;
+    }
+    if (cz > cw) {
+      ++outside_far;
+    }
+  }
+
+  if (outside_left == 8 || outside_right == 8 || outside_bottom == 8 ||
+      outside_top == 8 || outside_near == 8 || outside_far == 8) {
+    return false;
+  }
+  return true;
+}
+
+bool IsChunkVisible(const DirectX::XMMATRIX& view_proj, const Chunk& chunk) {
+  const float size = static_cast<float>(kChunkSize) * kBlockSize;
+  const DirectX::XMFLOAT3 min_point{
+      chunk.coord.x * size,
+      chunk.coord.y * size,
+      chunk.coord.z * size,
+  };
+  const DirectX::XMFLOAT3 max_point{
+      min_point.x + size,
+      min_point.y + size,
+      min_point.z + size,
+  };
+  return IsAabbVisible(view_proj, min_point, max_point);
 }
 
 DirectX::XMFLOAT4 ApplyShade(const DirectX::XMFLOAT4& color, float shade) {
@@ -776,28 +1015,33 @@ void AddFaceScaled(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
   }
 }
 
-std::vector<Vertex> BuildVoxelMesh(const VoxelChunk& chunk) {
+std::vector<Vertex> BuildVoxelMesh(const World& world, const Chunk& chunk) {
   std::vector<Vertex> vertices;
   vertices.reserve(static_cast<size_t>(kChunkVolume) * 36u);
-  const float half = 0.5f * kChunkSize * kBlockSize;
+  const int base_x = chunk.coord.x * kChunkSize;
+  const int base_y = chunk.coord.y * kChunkSize;
+  const int base_z = chunk.coord.z * kChunkSize;
   for (int z = 0; z < kChunkSize; ++z) {
     for (int y = 0; y < kChunkSize; ++y) {
       for (int x = 0; x < kChunkSize; ++x) {
-        const BlockId id = chunk.Get(x, y, z);
+        const BlockId id = chunk.voxels.Get(x, y, z);
         if (id == BlockId::Air) {
           continue;
         }
+        const int world_x = base_x + x;
+        const int world_y = base_y + y;
+        const int world_z = base_z + z;
         for (const auto& face : kFaces) {
           const BlockId neighbor =
-              GetBlockSafe(chunk, x + face.neighbor.x, y + face.neighbor.y,
-                           z + face.neighbor.z);
+              GetBlock(world, world_x + face.neighbor.x,
+                       world_y + face.neighbor.y, world_z + face.neighbor.z);
           if (neighbor != BlockId::Air) {
             continue;
           }
           const DirectX::XMFLOAT3 base{
-              (x * kBlockSize) - half,
-              y * kBlockSize,
-              (z * kBlockSize) - half,
+              world_x * kBlockSize,
+              world_y * kBlockSize,
+              world_z * kBlockSize,
           };
           const DirectX::XMFLOAT4 base_color{1.0f, 1.0f, 1.0f, 1.0f};
           const DirectX::XMFLOAT4 shaded = ApplyShade(base_color, face.shade);
@@ -813,12 +1057,11 @@ std::vector<Vertex> BuildVoxelMesh(const VoxelChunk& chunk) {
 std::vector<Vertex> BuildSelectionMesh(const Int3& block) {
   std::vector<Vertex> vertices;
   vertices.reserve(36u);
-  const float half = 0.5f * kChunkSize * kBlockSize;
   const float expand = (kSelectionScale - 1.0f) * 0.5f * kBlockSize;
   const DirectX::XMFLOAT3 base{
-      (block.x * kBlockSize) - half - expand,
+      (block.x * kBlockSize) - expand,
       (block.y * kBlockSize) - expand,
-      (block.z * kBlockSize) - half - expand,
+      (block.z * kBlockSize) - expand,
   };
   const DirectX::XMFLOAT4 highlight{1.0f, 1.0f, 0.2f, 1.0f};
   for (const auto& face : kFaces) {
@@ -828,41 +1071,41 @@ std::vector<Vertex> BuildSelectionMesh(const Int3& block) {
   return vertices;
 }
 
-bool UploadVoxelMesh(const std::vector<Vertex>& vertices) {
+bool UploadChunkMesh(Chunk& chunk, const std::vector<Vertex>& vertices) {
   if (!g_d3d.device || !g_d3d.context) {
     return false;
   }
   if (vertices.empty()) {
-    g_d3d.vertex_count = 0;
+    chunk.vertex_count = 0;
     return true;
   }
-  g_d3d.vertex_count = static_cast<UINT>(vertices.size());
-  const UINT byte_size = g_d3d.vertex_count * sizeof(Vertex);
-  if (!g_d3d.vertex_buffer || byte_size > g_d3d.vertex_buffer_size) {
-    g_d3d.vertex_buffer.Reset();
+  chunk.vertex_count = static_cast<UINT>(vertices.size());
+  const UINT byte_size = chunk.vertex_count * sizeof(Vertex);
+  if (!chunk.vertex_buffer || byte_size > chunk.vertex_buffer_size) {
+    chunk.vertex_buffer.Reset();
     D3D11_BUFFER_DESC buffer_desc{};
     buffer_desc.ByteWidth = byte_size;
     buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
     buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     HRESULT hr = g_d3d.device->CreateBuffer(&buffer_desc, nullptr,
-                                            &g_d3d.vertex_buffer);
+                                            &chunk.vertex_buffer);
     if (FAILED(hr)) {
       ShowError("Failed to create voxel vertex buffer", hr);
       return false;
     }
-    g_d3d.vertex_buffer_size = byte_size;
+    chunk.vertex_buffer_size = byte_size;
   }
 
   D3D11_MAPPED_SUBRESOURCE mapped{};
-  HRESULT hr = g_d3d.context->Map(g_d3d.vertex_buffer.Get(), 0,
+  HRESULT hr = g_d3d.context->Map(chunk.vertex_buffer.Get(), 0,
                                   D3D11_MAP_WRITE_DISCARD, 0, &mapped);
   if (FAILED(hr)) {
     ShowError("Failed to map voxel vertex buffer", hr);
     return false;
   }
   std::memcpy(mapped.pData, vertices.data(), byte_size);
-  g_d3d.context->Unmap(g_d3d.vertex_buffer.Get(), 0);
+  g_d3d.context->Unmap(chunk.vertex_buffer.Get(), 0);
   return true;
 }
 
@@ -946,10 +1189,9 @@ std::vector<Vertex> BuildHudMesh() {
   y += line_height;
 
   int block_id = -1;
-  if (g_hover_valid &&
-      InBounds(g_hover_hit.block.x, g_hover_hit.block.y, g_hover_hit.block.z)) {
-    block_id = static_cast<int>(
-        g_chunk.Get(g_hover_hit.block.x, g_hover_hit.block.y, g_hover_hit.block.z));
+  if (g_hover_valid) {
+    block_id = static_cast<int>(GetBlock(g_world, g_hover_hit.block.x,
+                                         g_hover_hit.block.y, g_hover_hit.block.z));
   }
   std::snprintf(buffer, sizeof(buffer), "B:%d", block_id);
   DrawText(vertices, x, y, kHudScale, buffer, white, screen_w, screen_h);
@@ -995,70 +1237,134 @@ bool UploadHudMesh(const std::vector<Vertex>& vertices) {
   return true;
 }
 
+bool NextToken(std::istream& input, std::string& token) {
+  token.clear();
+  char ch = '\0';
+  while (input.get(ch)) {
+    if (std::isspace(static_cast<unsigned char>(ch))) {
+      continue;
+    }
+    if (ch == '#') {
+      std::string line;
+      std::getline(input, line);
+      continue;
+    }
+    token.push_back(ch);
+    while (input.get(ch)) {
+      if (std::isspace(static_cast<unsigned char>(ch))) {
+        break;
+      }
+      if (ch == '#') {
+        std::string line;
+        std::getline(input, line);
+        break;
+      }
+      token.push_back(ch);
+    }
+    return true;
+  }
+  return false;
+}
+
+bool LoadPPMFile(const char* path, std::vector<uint8_t>& pixels, int& width,
+                 int& height) {
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    return false;
+  }
+
+  std::string token;
+  if (!NextToken(file, token) || token != "P3") {
+    return false;
+  }
+  if (!NextToken(file, token)) {
+    return false;
+  }
+  width = static_cast<int>(std::strtol(token.c_str(), nullptr, 10));
+  if (!NextToken(file, token)) {
+    return false;
+  }
+  height = static_cast<int>(std::strtol(token.c_str(), nullptr, 10));
+  if (!NextToken(file, token)) {
+    return false;
+  }
+  const int max_value = static_cast<int>(std::strtol(token.c_str(), nullptr, 10));
+  if (width <= 0 || height <= 0 || max_value <= 0) {
+    return false;
+  }
+
+  const int pixel_count = width * height;
+  pixels.resize(static_cast<size_t>(pixel_count) * 4u);
+  for (int i = 0; i < pixel_count; ++i) {
+    if (!NextToken(file, token)) {
+      return false;
+    }
+    int r = static_cast<int>(std::strtol(token.c_str(), nullptr, 10));
+    if (!NextToken(file, token)) {
+      return false;
+    }
+    int g = static_cast<int>(std::strtol(token.c_str(), nullptr, 10));
+    if (!NextToken(file, token)) {
+      return false;
+    }
+    int b = static_cast<int>(std::strtol(token.c_str(), nullptr, 10));
+
+    if (max_value != 255 && max_value > 0) {
+      r = (r * 255) / max_value;
+      g = (g * 255) / max_value;
+      b = (b * 255) / max_value;
+    }
+
+    r = std::clamp(r, 0, 255);
+    g = std::clamp(g, 0, 255);
+    b = std::clamp(b, 0, 255);
+
+    const size_t base = static_cast<size_t>(i) * 4u;
+    pixels[base + 0] = static_cast<uint8_t>(r);
+    pixels[base + 1] = static_cast<uint8_t>(g);
+    pixels[base + 2] = static_cast<uint8_t>(b);
+    pixels[base + 3] = 255u;
+  }
+
+  return true;
+}
+
 bool CreateTextureAtlas() {
   if (!g_d3d.device) {
     return false;
   }
-
-  std::vector<uint8_t> pixels(static_cast<size_t>(kAtlasWidth) *
-                              static_cast<size_t>(kAtlasHeight) * 4u);
-  auto set_pixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b,
-                       uint8_t a = 255) {
-    const int index = (y * kAtlasWidth + x) * 4;
-    pixels[static_cast<size_t>(index) + 0] = r;
-    pixels[static_cast<size_t>(index) + 1] = g;
-    pixels[static_cast<size_t>(index) + 2] = b;
-    pixels[static_cast<size_t>(index) + 3] = a;
+  const char* paths[] = {
+      "assets/atlas.ppm",
+      "dx11/assets/atlas.ppm",
+      "../assets/atlas.ppm",
+      "../../dx11/assets/atlas.ppm",
   };
 
-  auto set_tile_pixel = [&](int tile_index, int x, int y, uint8_t r, uint8_t g,
-                            uint8_t b) {
-    const int tile_x = tile_index % kAtlasTilesX;
-    const int tile_y = tile_index / kAtlasTilesX;
-    const int px = tile_x * kAtlasTileSize + x;
-    const int py = tile_y * kAtlasTileSize + y;
-    set_pixel(px, py, r, g, b, 255);
-  };
-
-  for (int y = 0; y < kAtlasTileSize; ++y) {
-    for (int x = 0; x < kAtlasTileSize; ++x) {
-      const bool speckle = ((x + y) % 5) == 0;
-      const uint8_t g = speckle ? 160 : 180;
-      set_tile_pixel(kTileGrassTop, x, y, 70, g, 70);
+  std::vector<uint8_t> pixels;
+  int width = 0;
+  int height = 0;
+  bool loaded = false;
+  for (const char* path : paths) {
+    if (LoadPPMFile(path, pixels, width, height)) {
+      loaded = true;
+      break;
     }
   }
 
-  for (int y = 0; y < kAtlasTileSize; ++y) {
-    for (int x = 0; x < kAtlasTileSize; ++x) {
-      if (y < 2) {
-        set_tile_pixel(kTileGrassSide, x, y, 70, 180, 70);
-      } else {
-        set_tile_pixel(kTileGrassSide, x, y, 120, 90, 60);
-      }
-    }
+  if (!loaded) {
+    MessageBoxA(nullptr, "Failed to load assets/atlas.ppm.",
+                "Texture Load Error", MB_ICONERROR);
+    return false;
   }
 
-  for (int y = 0; y < kAtlasTileSize; ++y) {
-    for (int x = 0; x < kAtlasTileSize; ++x) {
-      const bool speckle = ((x * 3 + y * 7) % 9) == 0;
-      const uint8_t r = speckle ? 140 : 120;
-      const uint8_t g = speckle ? 110 : 90;
-      const uint8_t b = speckle ? 80 : 60;
-      set_tile_pixel(kTileDirt, x, y, r, g, b);
-    }
-  }
-
-  for (int y = 0; y < kAtlasTileSize; ++y) {
-    for (int x = 0; x < kAtlasTileSize; ++x) {
-      const bool speckle = ((x * 5 + y * 11) % 13) == 0;
-      const uint8_t c = speckle ? 160 : 130;
-      set_tile_pixel(kTileStone, x, y, c, c, c);
-    }
+  if ((width % kAtlasTilesX) != 0 || (height % kAtlasTilesY) != 0) {
+    MessageBoxA(nullptr, "Atlas size does not match tile layout.",
+                "Texture Warning", MB_ICONWARNING);
   }
 
   D3D11_TEXTURE2D_DESC desc{};
-  desc.Width = kAtlasWidth;
-  desc.Height = kAtlasHeight;
+  desc.Width = static_cast<UINT>(width);
+  desc.Height = static_cast<UINT>(height);
   desc.MipLevels = 1;
   desc.ArraySize = 1;
   desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1068,7 +1374,7 @@ bool CreateTextureAtlas() {
 
   D3D11_SUBRESOURCE_DATA init_data{};
   init_data.pSysMem = pixels.data();
-  init_data.SysMemPitch = kAtlasWidth * 4;
+  init_data.SysMemPitch = static_cast<UINT>(width * 4);
 
   Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
   HRESULT hr = g_d3d.device->CreateTexture2D(&desc, &init_data, &texture);
@@ -1379,9 +1685,8 @@ bool CreateDeviceAndSwapChain(HWND hwnd, UINT width, UINT height) {
     return false;
   }
 
-  GenerateFlatChunk(g_chunk);
-  const std::vector<Vertex> vertices = BuildVoxelMesh(g_chunk);
-  if (!UploadVoxelMesh(vertices)) {
+  StreamChunks();
+  if (!UpdateChunkMeshes()) {
     return false;
   }
 
@@ -1428,8 +1733,7 @@ void Render() {
                                          1.0f, 0);
   }
   if (g_d3d.vertex_shader && g_d3d.pixel_shader && g_d3d.input_layout &&
-      g_d3d.vertex_buffer && g_d3d.constant_buffer && g_d3d.texture_srv &&
-      g_d3d.sampler_state && g_d3d.vertex_count > 0) {
+      g_d3d.constant_buffer && g_d3d.texture_srv && g_d3d.sampler_state) {
     const float aspect =
         (g_d3d.height == 0) ? 1.0f
                             : static_cast<float>(g_d3d.width) /
@@ -1442,7 +1746,9 @@ void Render() {
     const DirectX::XMMATRIX proj =
         DirectX::XMMatrixPerspectiveFovLH(DirectX::XMConvertToRadians(60.0f),
                                           aspect, 0.1f, 200.0f);
-    const DirectX::XMMATRIX mvp = DirectX::XMMatrixTranspose(world * view * proj);
+    const DirectX::XMMATRIX view_proj = view * proj;
+    const DirectX::XMMATRIX mvp =
+        DirectX::XMMatrixTranspose(world * view * proj);
     DirectX::XMFLOAT4X4 mvp_matrix;
     DirectX::XMStoreFloat4x4(&mvp_matrix, mvp);
     g_d3d.context->UpdateSubresource(g_d3d.constant_buffer.Get(), 0, nullptr,
@@ -1450,16 +1756,25 @@ void Render() {
 
     g_d3d.context->IASetInputLayout(g_d3d.input_layout.Get());
     g_d3d.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    g_d3d.context->IASetVertexBuffers(
-        0, 1, g_d3d.vertex_buffer.GetAddressOf(), &g_d3d.vertex_stride,
-        &g_d3d.vertex_offset);
     g_d3d.context->VSSetShader(g_d3d.vertex_shader.Get(), nullptr, 0);
     g_d3d.context->VSSetConstantBuffers(0, 1, g_d3d.constant_buffer.GetAddressOf());
     g_d3d.context->PSSetShader(g_d3d.pixel_shader.Get(), nullptr, 0);
     g_d3d.context->PSSetShaderResources(0, 1, g_d3d.texture_srv.GetAddressOf());
     g_d3d.context->PSSetSamplers(0, 1, g_d3d.sampler_state.GetAddressOf());
     g_d3d.context->RSSetState(g_d3d.rasterizer_state.Get());
-    g_d3d.context->Draw(g_d3d.vertex_count, 0);
+    for (const auto& entry : g_world.chunks) {
+      const Chunk& chunk = entry.second;
+      if (!chunk.vertex_buffer || chunk.vertex_count == 0) {
+        continue;
+      }
+      if (!IsChunkVisible(view_proj, chunk)) {
+        continue;
+      }
+      ID3D11Buffer* buffer = chunk.vertex_buffer.Get();
+      g_d3d.context->IASetVertexBuffers(0, 1, &buffer, &g_d3d.vertex_stride,
+                                        &g_d3d.vertex_offset);
+      g_d3d.context->Draw(chunk.vertex_count, 0);
+    }
   }
   if (g_d3d.wireframe_state && g_d3d.solid_pixel_shader &&
       g_d3d.highlight_vertex_buffer && g_d3d.highlight_vertex_count > 0) {
@@ -1587,9 +1902,12 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR,
       }
       UpdateFps(dt);
       UpdateInput(dt);
+      StreamChunks();
+      UpdateChunkMeshes();
       UpdateHoverHit();
       const bool changed = HandleBlockInteraction();
       if (changed) {
+        UpdateChunkMeshes();
         UpdateHoverHit();
       }
       UpdateSelectionMesh();

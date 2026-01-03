@@ -12,6 +12,7 @@ struct InputState {
   bool rmb_pressed = false;
   bool jump_down = false;
   bool jump_pressed = false;
+  bool crouch_down = false;
   float mouse_dx = 0.0f;
   float mouse_dy = 0.0f;
   int move_forward = 0;

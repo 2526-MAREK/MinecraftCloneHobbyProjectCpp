@@ -23,17 +23,51 @@ int MaxCell(float value) {
   return static_cast<int>(std::floor(value - kCollisionEpsilon));
 }
 
+float GetPlayerHeight(const PlayerState& player) {
+  return player.crouching ? kPlayerCrouchHeight : kPlayerHeight;
+}
+
 Aabb MakeAabb(const PlayerState& player) {
+  const float height = GetPlayerHeight(player);
   return {player.position.x - kPlayerRadius,
           player.position.y,
           player.position.z - kPlayerRadius,
           player.position.x + kPlayerRadius,
-          player.position.y + kPlayerHeight,
+          player.position.y + height,
           player.position.z + kPlayerRadius};
 }
 
 bool IsSolid(const World& world, int x, int y, int z) {
   return GetBlock(world, x, y, z) != BlockId::Air;
+}
+
+bool IsAabbClear(const World& world, const Aabb& box) {
+  const int min_x = MinCell(box.min_x);
+  const int max_x = MaxCell(box.max_x);
+  const int min_y = MinCell(box.min_y);
+  const int max_y = MaxCell(box.max_y);
+  const int min_z = MinCell(box.min_z);
+  const int max_z = MaxCell(box.max_z);
+  if (max_x < min_x || max_y < min_y || max_z < min_z) {
+    return true;
+  }
+  for (int x = min_x; x <= max_x; ++x) {
+    for (int y = min_y; y <= max_y; ++y) {
+      for (int z = min_z; z <= max_z; ++z) {
+        if (IsSolid(world, x, y, z)) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool CanStandUp(const PlayerState& player, const World& world) {
+  PlayerState standing = player;
+  standing.crouching = false;
+  const Aabb box = MakeAabb(standing);
+  return IsAabbClear(world, box);
 }
 
 bool MoveAlongX(PlayerState& player, const World& world, float delta) {
@@ -254,6 +288,7 @@ void InitPlayer(PlayerState& player, const DirectX::XMFLOAT3& position) {
   player.position = position;
   player.velocity = {0.0f, 0.0f, 0.0f};
   player.on_ground = false;
+  player.crouching = false;
 }
 
 void UpdatePlayer(PlayerState& player, const World& world,
@@ -262,6 +297,13 @@ void UpdatePlayer(PlayerState& player, const World& world,
   const int move_forward = input_active ? input.move_forward : 0;
   const int move_right = input_active ? input.move_right : 0;
   const bool jump_pressed = input_active && input.jump_pressed;
+  const bool crouch_down = input_active && input.crouch_down;
+
+  if (crouch_down) {
+    player.crouching = true;
+  } else if (player.crouching && CanStandUp(player, world)) {
+    player.crouching = false;
+  }
 
   DirectX::XMVECTOR forward = GetCameraForward(camera);
   forward = DirectX::XMVectorSetY(forward, 0.0f);
@@ -294,7 +336,10 @@ void UpdatePlayer(PlayerState& player, const World& world,
 
   DirectX::XMFLOAT3 wish_dir{};
   DirectX::XMStoreFloat3(&wish_dir, wish);
-  const float speed = camera.move_speed * (input.speed_boost ? 3.0f : 1.0f);
+  float speed = camera.move_speed * (input.speed_boost ? 1.7f : 1.0f);
+  if (player.crouching) {
+    speed *= 0.45f;
+  }
   player.velocity.x = wish_dir.x * speed;
   player.velocity.z = wish_dir.z * speed;
 
@@ -309,11 +354,31 @@ void UpdatePlayer(PlayerState& player, const World& world,
   const float dz = player.velocity.z * dt;
   const float dy = player.velocity.y * dt;
 
-  if (MoveAlongX(player, world, dx)) {
-    player.velocity.x = 0.0f;
+  PlayerState pre_step = player;
+  bool hit_x = MoveAlongX(player, world, dx);
+  bool hit_z = MoveAlongZ(player, world, dz);
+
+  bool stepped = false;
+  if (player.on_ground && (hit_x || hit_z)) {
+    PlayerState step = pre_step;
+    if (!MoveAlongY(step, world, kPlayerStepHeight)) {
+      const bool step_hit_x = MoveAlongX(step, world, dx);
+      const bool step_hit_z = MoveAlongZ(step, world, dz);
+      if (!step_hit_x && !step_hit_z) {
+        MoveAlongY(step, world, -(kPlayerStepHeight + kCollisionEpsilon));
+        player = step;
+        stepped = true;
+      }
+    }
   }
-  if (MoveAlongZ(player, world, dz)) {
-    player.velocity.z = 0.0f;
+
+  if (!stepped) {
+    if (hit_x) {
+      player.velocity.x = 0.0f;
+    }
+    if (hit_z) {
+      player.velocity.z = 0.0f;
+    }
   }
 
   bool hit_y = MoveAlongY(player, world, dy);
@@ -328,6 +393,21 @@ void UpdatePlayer(PlayerState& player, const World& world,
 }
 
 DirectX::XMFLOAT3 GetPlayerEyePosition(const PlayerState& player) {
-  return {player.position.x, player.position.y + kPlayerEyeHeight,
-          player.position.z};
+  const float eye =
+      player.crouching ? kPlayerCrouchEyeHeight : kPlayerEyeHeight;
+  return {player.position.x, player.position.y + eye, player.position.z};
+}
+
+bool WouldIntersectBlock(const PlayerState& player, int x, int y, int z) {
+  const Aabb box = MakeAabb(player);
+  const float min_x = static_cast<float>(x);
+  const float min_y = static_cast<float>(y);
+  const float min_z = static_cast<float>(z);
+  const float max_x = min_x + kBlockSize;
+  const float max_y = min_y + kBlockSize;
+  const float max_z = min_z + kBlockSize;
+  const bool overlap =
+      (box.min_x < max_x && box.max_x > min_x && box.min_y < max_y &&
+       box.max_y > min_y && box.min_z < max_z && box.max_z > min_z);
+  return overlap;
 }

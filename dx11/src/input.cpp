@@ -43,6 +43,8 @@ void InitInput(InputState& input, HWND hwnd) {
   input.rmb_pressed = false;
   input.jump_down = false;
   input.jump_pressed = false;
+  input.crouch_down = false;
+  input.speed_boost = false;
 }
 
 void UpdateClipRect(InputState& input) {
@@ -96,12 +98,15 @@ void UpdateInput(InputState& input) {
   const bool lmb = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
   const bool rmb = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
   const bool jump = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+  const bool crouch = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+  const bool sprint = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
   input.lmb_pressed = lmb && !input.lmb_down;
   input.rmb_pressed = rmb && !input.rmb_down;
   input.lmb_down = lmb;
   input.rmb_down = rmb;
   input.jump_pressed = jump && !input.jump_down;
   input.jump_down = jump;
+  input.crouch_down = crouch;
 
   input.mouse_dx = 0.0f;
   input.mouse_dy = 0.0f;
@@ -137,8 +142,8 @@ void UpdateInput(InputState& input) {
   if (jump) {
     ++input.move_up;
   }
-  if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
+  if (sprint) {
     --input.move_up;
   }
-  input.speed_boost = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+  input.speed_boost = sprint;
 }

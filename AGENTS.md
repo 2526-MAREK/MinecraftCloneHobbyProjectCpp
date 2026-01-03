@@ -22,8 +22,9 @@ DirectX 11 (native .sln):
 - Per-chunk frustum culling.
 - Texture atlas loaded from `dx11/assets/atlas.ppm` + per-face UVs.
 - Mouse look camera (yaw/pitch).
-- Block break/place with LMB/RMB.
-- Collision + gravity player controller (WASD move, Space jump, Ctrl speed).
+- Block break/place with LMB/RMB (placement blocked inside the player AABB).
+- Collision + gravity player controller (WASD move, Space jump, Shift sprint,
+  Ctrl crouch, 1-block step-up).
 - Hover highlight (wireframe selection box).
 - Crosshair + basic HUD (FPS, position, block ID).
 
@@ -39,7 +40,7 @@ DirectX 11 (native .sln):
 
 ## Next Steps (Suggested)
 1. Load textures from file via PNG + WIC (replace PPM loader).
-2. Add step-up handling and sprint/crouch tweaks to the controller.
+2. Add block damage crack overlay + break timer.
 3. Add chunk LOD or async generation for larger worlds.
 
 ## Guidelines for Changes

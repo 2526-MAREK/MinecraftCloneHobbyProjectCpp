@@ -166,9 +166,16 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR,
       bool changed = false;
       if (g_input.mouse_captured && g_hover_valid &&
           (g_input.lmb_pressed || g_input.rmb_pressed)) {
+        bool allow_place = g_input.rmb_pressed;
+        if (allow_place) {
+          const Int3& place = g_hover_hit.previous;
+          if (WouldIntersectBlock(g_player, place.x, place.y, place.z)) {
+            allow_place = false;
+          }
+        }
         changed = HandleBlockInteraction(g_world, g_hover_hit,
                                          g_input.lmb_pressed,
-                                         g_input.rmb_pressed);
+                                         allow_place);
       }
       if (changed) {
         UpdateChunkMeshes(g_renderer, g_world);

@@ -280,7 +280,13 @@ bool CreatePipeline(RendererState& renderer) {
       float2 uv : TEXCOORD0;
     };
     float4 main(PSInput input) : SV_TARGET {
-      return atlas.Sample(atlasSampler, input.uv) * input.color;
+      const float tileIndex = input.color.a;
+      const float2 tileSize = float2(1.0f / 4.0f, 1.0f / 1.0f);
+      const float tileX = fmod(tileIndex, 4.0f);
+      const float tileY = floor(tileIndex / 4.0f);
+      const float2 base = float2(tileX, tileY) * tileSize;
+      const float2 uv = base + frac(input.uv) * tileSize;
+      return atlas.Sample(atlasSampler, uv) * float4(input.color.rgb, 1.0f);
     }
   )";
 

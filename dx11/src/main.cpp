@@ -2,6 +2,7 @@
 
 #include "camera.h"
 #include "input.h"
+#include "player.h"
 #include "renderer.h"
 #include "world.h"
 
@@ -13,8 +14,9 @@ constexpr wchar_t kWindowTitle[] = L"Minecraft Clone - DirectX 11";
 
 RendererState g_renderer;
 World g_world;
-CameraState g_camera = {{8.0f, 6.0f, -14.0f}, 0.0f, 0.0f, kMoveSpeed,
+CameraState g_camera = {{0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, kMoveSpeed,
                          kMouseSensitivity};
+PlayerState g_player;
 InputState g_input;
 
 RayHit g_hover_hit;
@@ -116,6 +118,8 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR,
   UpdateWindow(hwnd);
 
   InitInput(g_input, hwnd);
+  InitPlayer(g_player, {8.0f, 4.0f, -14.0f});
+  g_camera.position = GetPlayerEyePosition(g_player);
 
   RECT client_rect{};
   GetClientRect(hwnd, &client_rect);
@@ -152,7 +156,9 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR,
 
       UpdateFps(dt);
       UpdateInput(g_input);
-      UpdateCamera(g_camera, g_input, dt);
+      UpdateCameraLook(g_camera, g_input);
+      UpdatePlayer(g_player, g_world, g_camera, g_input, dt);
+      g_camera.position = GetPlayerEyePosition(g_player);
       StreamChunks(g_world, g_camera.position);
       UpdateChunkMeshes(g_renderer, g_world);
       UpdateHoverHit();

@@ -12,14 +12,24 @@ DirectX::XMVECTOR GetCameraForward(const CameraState& camera) {
       cos_pitch * sin_yaw, sin_pitch, cos_pitch * cos_yaw, 0.0f));
 }
 
+void UpdateCameraLook(CameraState& camera, const InputState& input) {
+  if (!input.mouse_captured) {
+    return;
+  }
+  if (input.mouse_dx == 0.0f && input.mouse_dy == 0.0f) {
+    return;
+  }
+  camera.yaw += input.mouse_dx * camera.mouse_sensitivity;
+  camera.pitch -= input.mouse_dy * camera.mouse_sensitivity;
+  camera.pitch = std::clamp(camera.pitch, -kMaxPitch, kMaxPitch);
+}
+
 void UpdateCamera(CameraState& camera, const InputState& input, float dt) {
   if (!input.mouse_captured) {
     return;
   }
 
-  camera.yaw += input.mouse_dx * camera.mouse_sensitivity;
-  camera.pitch -= input.mouse_dy * camera.mouse_sensitivity;
-  camera.pitch = std::clamp(camera.pitch, -kMaxPitch, kMaxPitch);
+  UpdateCameraLook(camera, input);
 
   const DirectX::XMVECTOR forward = GetCameraForward(camera);
   const DirectX::XMVECTOR up = DirectX::XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);

@@ -17,4 +17,5 @@ struct CameraState {
 };
 
 DirectX::XMVECTOR GetCameraForward(const CameraState& camera);
+void UpdateCameraLook(CameraState& camera, const InputState& input);
 void UpdateCamera(CameraState& camera, const InputState& input, float dt);

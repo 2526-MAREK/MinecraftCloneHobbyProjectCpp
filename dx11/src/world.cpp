@@ -404,7 +404,14 @@ void AddFace(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
              const FaceDef& face, const DirectX::XMFLOAT4& color,
              int tile_index) {
   constexpr int indices[6] = {0, 1, 2, 0, 2, 3};
-  const std::array<DirectX::XMFLOAT2, 4> uvs = GetTileUVs(tile_index);
+  const std::array<DirectX::XMFLOAT2, 4> uvs = {{
+      {0.0f, 0.0f},
+      {1.0f, 0.0f},
+      {1.0f, 1.0f},
+      {0.0f, 1.0f},
+  }};
+  const DirectX::XMFLOAT4 packed_color{color.x, color.y, color.z,
+                                       static_cast<float>(tile_index)};
   for (int i = 0; i < 6; ++i) {
     const int idx = indices[i];
     const DirectX::XMFLOAT3& corner = face.corners[static_cast<size_t>(idx)];
@@ -414,7 +421,7 @@ void AddFace(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
         base.y + corner.y * kBlockSize,
         base.z + corner.z * kBlockSize,
     };
-    vertex.color = color;
+    vertex.color = packed_color;
     vertex.uv = uvs[static_cast<size_t>(idx)];
     vertices.push_back(vertex);
   }
@@ -424,7 +431,14 @@ void AddFaceScaled(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
                    float scale, const FaceDef& face,
                    const DirectX::XMFLOAT4& color, int tile_index) {
   constexpr int indices[6] = {0, 1, 2, 0, 2, 3};
-  const std::array<DirectX::XMFLOAT2, 4> uvs = GetTileUVs(tile_index);
+  const std::array<DirectX::XMFLOAT2, 4> uvs = {{
+      {0.0f, 0.0f},
+      {1.0f, 0.0f},
+      {1.0f, 1.0f},
+      {0.0f, 1.0f},
+  }};
+  const DirectX::XMFLOAT4 packed_color{color.x, color.y, color.z,
+                                       static_cast<float>(tile_index)};
   const float size = kBlockSize * scale;
   for (int i = 0; i < 6; ++i) {
     const int idx = indices[i];
@@ -435,7 +449,66 @@ void AddFaceScaled(std::vector<Vertex>& vertices, const DirectX::XMFLOAT3& base,
         base.y + corner.y * size,
         base.z + corner.z * size,
     };
-    vertex.color = color;
+    vertex.color = packed_color;
+    vertex.uv = uvs[static_cast<size_t>(idx)];
+    vertices.push_back(vertex);
+  }
+}
+
+const FaceDef& GetFaceDef(FaceDir dir) {
+  return kFaces[static_cast<size_t>(dir)];
+}
+
+DirectX::XMFLOAT3 Subtract(const DirectX::XMFLOAT3& a,
+                           const DirectX::XMFLOAT3& b) {
+  return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+int AxisSign(const DirectX::XMFLOAT3& axis, int axis_index) {
+  const float value = (axis_index == 0) ? axis.x : (axis_index == 1 ? axis.y : axis.z);
+  return (value >= 0.0f) ? 1 : -1;
+}
+
+void AddGreedyFace(std::vector<Vertex>& vertices, const Int3& block,
+                   const FaceDef& face, int width, int height, BlockId id) {
+  const DirectX::XMFLOAT3 axis_u =
+      Subtract(face.corners[1], face.corners[0]);
+  const DirectX::XMFLOAT3 axis_v =
+      Subtract(face.corners[3], face.corners[0]);
+  const float w = static_cast<float>(width) * kBlockSize;
+  const float h = static_cast<float>(height) * kBlockSize;
+  const DirectX::XMFLOAT3 origin{
+      (static_cast<float>(block.x) + face.corners[0].x) * kBlockSize,
+      (static_cast<float>(block.y) + face.corners[0].y) * kBlockSize,
+      (static_cast<float>(block.z) + face.corners[0].z) * kBlockSize,
+  };
+
+  const DirectX::XMFLOAT3 p0 = origin;
+  const DirectX::XMFLOAT3 p1{origin.x + axis_u.x * w, origin.y + axis_u.y * w,
+                             origin.z + axis_u.z * w};
+  const DirectX::XMFLOAT3 p2{p1.x + axis_v.x * h, p1.y + axis_v.y * h,
+                             p1.z + axis_v.z * h};
+  const DirectX::XMFLOAT3 p3{origin.x + axis_v.x * h, origin.y + axis_v.y * h,
+                             origin.z + axis_v.z * h};
+
+  const int tile_index = GetTileIndex(id, face.dir);
+  const DirectX::XMFLOAT4 base_color{1.0f, 1.0f, 1.0f, 1.0f};
+  const DirectX::XMFLOAT4 shaded = ApplyShade(base_color, face.shade);
+  const DirectX::XMFLOAT4 packed_color{shaded.x, shaded.y, shaded.z,
+                                       static_cast<float>(tile_index)};
+  const std::array<DirectX::XMFLOAT2, 4> uvs = {{
+      {0.0f, 0.0f},
+      {static_cast<float>(width), 0.0f},
+      {static_cast<float>(width), static_cast<float>(height)},
+      {0.0f, static_cast<float>(height)},
+  }};
+  const DirectX::XMFLOAT3 positions[4] = {p0, p1, p2, p3};
+  constexpr int indices[6] = {0, 1, 2, 0, 2, 3};
+  for (int i = 0; i < 6; ++i) {
+    const int idx = indices[i];
+    Vertex vertex;
+    vertex.position = positions[idx];
+    vertex.color = packed_color;
     vertex.uv = uvs[static_cast<size_t>(idx)];
     vertices.push_back(vertex);
   }
@@ -447,32 +520,121 @@ std::vector<Vertex> BuildVoxelMesh(const World& world, const Chunk& chunk) {
   const int base_x = chunk.coord.x * kChunkSize;
   const int base_y = chunk.coord.y * kChunkSize;
   const int base_z = chunk.coord.z * kChunkSize;
-  for (int z = 0; z < kChunkSize; ++z) {
-    for (int y = 0; y < kChunkSize; ++y) {
-      for (int x = 0; x < kChunkSize; ++x) {
-        const BlockId id = chunk.voxels.Get(x, y, z);
-        if (id == BlockId::Air) {
-          continue;
+  const int dims[3] = {kChunkSize, kChunkSize, kChunkSize};
+
+  struct MaskCell {
+    BlockId id = BlockId::Air;
+    FaceDir dir = FaceDir::PosX;
+    bool visible = false;
+  };
+
+  for (int d = 0; d < 3; ++d) {
+    const int u = (d + 1) % 3;
+    const int v = (d + 2) % 3;
+    const int du = dims[u];
+    const int dv = dims[v];
+    std::vector<MaskCell> mask(static_cast<size_t>(du * dv));
+
+    for (int slice = 0; slice <= dims[d]; ++slice) {
+      for (int j = 0; j < dv; ++j) {
+        for (int i = 0; i < du; ++i) {
+          int coords[3] = {0, 0, 0};
+          coords[d] = slice;
+          coords[u] = i;
+          coords[v] = j;
+          const int wx = base_x + coords[0];
+          const int wy = base_y + coords[1];
+          const int wz = base_z + coords[2];
+
+          const int wx_a = wx - (d == 0 ? 1 : 0);
+          const int wy_a = wy - (d == 1 ? 1 : 0);
+          const int wz_a = wz - (d == 2 ? 1 : 0);
+
+          const BlockId a = GetBlock(world, wx_a, wy_a, wz_a);
+          const BlockId b = GetBlock(world, wx, wy, wz);
+          MaskCell cell{};
+          if (a != BlockId::Air && b == BlockId::Air) {
+            cell.visible = true;
+            cell.id = a;
+            cell.dir = (d == 0) ? FaceDir::PosX
+                                : (d == 1 ? FaceDir::PosY : FaceDir::PosZ);
+          } else if (a == BlockId::Air && b != BlockId::Air) {
+            cell.visible = true;
+            cell.id = b;
+            cell.dir = (d == 0) ? FaceDir::NegX
+                                : (d == 1 ? FaceDir::NegY : FaceDir::NegZ);
+          }
+          mask[static_cast<size_t>(i + j * du)] = cell;
         }
-        const int world_x = base_x + x;
-        const int world_y = base_y + y;
-        const int world_z = base_z + z;
-        for (const auto& face : kFaces) {
-          const BlockId neighbor =
-              GetBlock(world, world_x + face.neighbor.x,
-                       world_y + face.neighbor.y, world_z + face.neighbor.z);
-          if (neighbor != BlockId::Air) {
+      }
+
+      for (int j = 0; j < dv; ++j) {
+        for (int i = 0; i < du;) {
+          MaskCell cell = mask[static_cast<size_t>(i + j * du)];
+          if (!cell.visible) {
+            ++i;
             continue;
           }
-          const DirectX::XMFLOAT3 base{
-              world_x * kBlockSize,
-              world_y * kBlockSize,
-              world_z * kBlockSize,
+
+          int width = 1;
+          while (i + width < du) {
+            const MaskCell& next = mask[static_cast<size_t>(i + width + j * du)];
+            if (!next.visible || next.id != cell.id || next.dir != cell.dir) {
+              break;
+            }
+            ++width;
+          }
+
+          int height = 1;
+          bool done = false;
+          while (j + height < dv && !done) {
+            for (int k = 0; k < width; ++k) {
+              const MaskCell& next =
+                  mask[static_cast<size_t>(i + k + (j + height) * du)];
+              if (!next.visible || next.id != cell.id || next.dir != cell.dir) {
+                done = true;
+                break;
+              }
+            }
+            if (!done) {
+              ++height;
+            }
+          }
+
+          const FaceDef& face = GetFaceDef(cell.dir);
+          const DirectX::XMFLOAT3 axis_u =
+              Subtract(face.corners[1], face.corners[0]);
+          const DirectX::XMFLOAT3 axis_v =
+              Subtract(face.corners[3], face.corners[0]);
+          int block_coords[3] = {0, 0, 0};
+          block_coords[d] =
+              (cell.dir == FaceDir::PosX || cell.dir == FaceDir::PosY ||
+               cell.dir == FaceDir::PosZ)
+                  ? (slice - 1)
+                  : slice;
+          block_coords[u] = i;
+          block_coords[v] = j;
+
+          if (AxisSign(axis_u, u) < 0) {
+            block_coords[u] += width - 1;
+          }
+          if (AxisSign(axis_v, v) < 0) {
+            block_coords[v] += height - 1;
+          }
+
+          const Int3 block{
+              base_x + block_coords[0],
+              base_y + block_coords[1],
+              base_z + block_coords[2],
           };
-          const DirectX::XMFLOAT4 base_color{1.0f, 1.0f, 1.0f, 1.0f};
-          const DirectX::XMFLOAT4 shaded = ApplyShade(base_color, face.shade);
-          const int tile_index = GetTileIndex(id, face.dir);
-          AddFace(vertices, base, face, shaded, tile_index);
+          AddGreedyFace(vertices, block, face, width, height, cell.id);
+
+          for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+              mask[static_cast<size_t>(i + x + (j + y) * du)].visible = false;
+            }
+          }
+          i += width;
         }
       }
     }

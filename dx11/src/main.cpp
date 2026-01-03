@@ -40,6 +40,11 @@ constexpr float kMouseSensitivity = 0.002f;
 constexpr float kMaxPitch = DirectX::XM_PIDIV2 - 0.01f;
 constexpr float kRaycastDistance = 8.0f;
 constexpr float kSelectionScale = 1.03f;
+constexpr float kHudScale = 2.0f;
+constexpr float kHudPadding = 12.0f;
+constexpr float kCrosshairLength = 10.0f;
+constexpr float kCrosshairGap = 6.0f;
+constexpr float kCrosshairThickness = 2.0f;
 
 using D3DCompileFn =
     HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*,
@@ -67,6 +72,9 @@ struct D3DState {
   Microsoft::WRL::ComPtr<ID3D11PixelShader> solid_pixel_shader;
   Microsoft::WRL::ComPtr<ID3D11Buffer> highlight_vertex_buffer;
   Microsoft::WRL::ComPtr<ID3D11RasterizerState> wireframe_state;
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilState> depth_state;
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilState> depth_state_no_depth;
+  Microsoft::WRL::ComPtr<ID3D11Buffer> hud_vertex_buffer;
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> texture_srv;
   Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler_state;
   UINT vertex_stride = 0;
@@ -75,6 +83,8 @@ struct D3DState {
   UINT vertex_buffer_size = 0;
   UINT highlight_vertex_count = 0;
   UINT highlight_vertex_buffer_size = 0;
+  UINT hud_vertex_count = 0;
+  UINT hud_vertex_buffer_size = 0;
 };
 
 struct CameraState {
@@ -180,6 +190,8 @@ std::vector<Vertex> BuildVoxelMesh(const VoxelChunk& chunk);
 bool UploadVoxelMesh(const std::vector<Vertex>& vertices);
 std::vector<Vertex> BuildSelectionMesh(const Int3& block);
 bool UploadSelectionMesh(const std::vector<Vertex>& vertices);
+std::vector<Vertex> BuildHudMesh();
+bool UploadHudMesh(const std::vector<Vertex>& vertices);
 
 D3DState g_d3d;
 VoxelChunk g_chunk;
@@ -189,6 +201,9 @@ bool g_mouse_captured = false;
 bool g_escape_down = false;
 bool g_lmb_down = false;
 bool g_rmb_down = false;
+float g_fps = 0.0f;
+float g_fps_timer = 0.0f;
+int g_fps_samples = 0;
 
 void ShowError(const char* message, HRESULT hr) {
   char buffer[256];
@@ -342,6 +357,16 @@ void UpdateCamera(float dt) {
     DirectX::XMVECTOR pos = DirectX::XMLoadFloat3(&g_camera.position);
     pos = DirectX::XMVectorAdd(pos, DirectX::XMVectorScale(move, speed * dt));
     DirectX::XMStoreFloat3(&g_camera.position, pos);
+  }
+}
+
+void UpdateFps(float dt) {
+  g_fps_timer += dt;
+  ++g_fps_samples;
+  if (g_fps_timer >= 0.25f) {
+    g_fps = static_cast<float>(g_fps_samples) / g_fps_timer;
+    g_fps_timer = 0.0f;
+    g_fps_samples = 0;
   }
 }
 
@@ -576,6 +601,104 @@ DirectX::XMFLOAT4 ApplyShade(const DirectX::XMFLOAT4& color, float shade) {
   return {color.x * shade, color.y * shade, color.z * shade, color.w};
 }
 
+struct Glyph {
+  char ch;
+  std::array<uint8_t, 7> rows;
+};
+
+const std::array<Glyph, 17> kGlyphs = {{
+    {'0', {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110}},
+    {'1', {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110}},
+    {'2', {0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111}},
+    {'3', {0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110}},
+    {'4', {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010}},
+    {'5', {0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110}},
+    {'6', {0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110}},
+    {'7', {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000}},
+    {'8', {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110}},
+    {'9', {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100}},
+    {'F', {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000}},
+    {'P', {0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000}},
+    {'S', {0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110}},
+    {'X', {0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b01010, 0b10001}},
+    {'Y', {0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100}},
+    {'Z', {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111}},
+    {'B', {0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110}},
+}};
+
+const Glyph* FindGlyph(char ch) {
+  for (const auto& glyph : kGlyphs) {
+    if (glyph.ch == ch) {
+      return &glyph;
+    }
+  }
+  return nullptr;
+}
+
+void AddQuadPixels(std::vector<Vertex>& vertices, float x, float y, float w,
+                   float h, const DirectX::XMFLOAT4& color, float screen_w,
+                   float screen_h) {
+  const float x0 = (x / screen_w) * 2.0f - 1.0f;
+  const float x1 = ((x + w) / screen_w) * 2.0f - 1.0f;
+  const float y0 = 1.0f - (y / screen_h) * 2.0f;
+  const float y1 = 1.0f - ((y + h) / screen_h) * 2.0f;
+
+  const DirectX::XMFLOAT2 uv{0.0f, 0.0f};
+  vertices.push_back({{x0, y0, 0.0f}, color, uv});
+  vertices.push_back({{x1, y0, 0.0f}, color, uv});
+  vertices.push_back({{x1, y1, 0.0f}, color, uv});
+  vertices.push_back({{x0, y0, 0.0f}, color, uv});
+  vertices.push_back({{x1, y1, 0.0f}, color, uv});
+  vertices.push_back({{x0, y1, 0.0f}, color, uv});
+}
+
+void DrawText(std::vector<Vertex>& vertices, float x, float y, float scale,
+              const char* text, const DirectX::XMFLOAT4& color, float screen_w,
+              float screen_h) {
+  const float advance = 6.0f * scale;
+  const float pixel = scale;
+  for (const char* ptr = text; *ptr; ++ptr) {
+    const char ch = *ptr;
+    if (ch == ' ') {
+      x += advance;
+      continue;
+    }
+    if (ch == ':' || ch == '-') {
+      const bool is_colon = (ch == ':');
+      for (int row = 0; row < 7; ++row) {
+        bool on = false;
+        if (is_colon) {
+          on = (row == 1 || row == 2 || row == 4 || row == 5);
+        } else {
+          on = (row == 3);
+        }
+        if (on) {
+          AddQuadPixels(vertices, x + 2.0f * pixel, y + row * pixel, pixel,
+                        pixel, color, screen_w, screen_h);
+        }
+      }
+      x += advance;
+      continue;
+    }
+
+    const Glyph* glyph = FindGlyph(ch);
+    if (!glyph) {
+      x += advance;
+      continue;
+    }
+    for (int row = 0; row < 7; ++row) {
+      const uint8_t bits = glyph->rows[static_cast<size_t>(row)];
+      for (int col = 0; col < 5; ++col) {
+        if (bits & (1u << (4 - col))) {
+          AddQuadPixels(vertices, x + col * pixel, y + row * pixel, pixel,
+                        pixel, color, screen_w, screen_h);
+        }
+      }
+    }
+    x += advance;
+  }
+}
+
 int GetTileIndex(BlockId id, FaceDir dir) {
   switch (id) {
     case BlockId::Grass:
@@ -779,6 +902,96 @@ bool UploadSelectionMesh(const std::vector<Vertex>& vertices) {
   }
   std::memcpy(mapped.pData, vertices.data(), byte_size);
   g_d3d.context->Unmap(g_d3d.highlight_vertex_buffer.Get(), 0);
+  return true;
+}
+
+std::vector<Vertex> BuildHudMesh() {
+  std::vector<Vertex> vertices;
+  if (g_d3d.width == 0 || g_d3d.height == 0) {
+    return vertices;
+  }
+
+  const float screen_w = static_cast<float>(g_d3d.width);
+  const float screen_h = static_cast<float>(g_d3d.height);
+  const DirectX::XMFLOAT4 white{1.0f, 1.0f, 1.0f, 1.0f};
+
+  const float cx = screen_w * 0.5f;
+  const float cy = screen_h * 0.5f;
+  const float t = kCrosshairThickness;
+  const float len = kCrosshairLength;
+  const float gap = kCrosshairGap;
+  AddQuadPixels(vertices, cx - gap - len, cy - t * 0.5f, len, t, white, screen_w,
+                screen_h);
+  AddQuadPixels(vertices, cx + gap, cy - t * 0.5f, len, t, white, screen_w,
+                screen_h);
+  AddQuadPixels(vertices, cx - t * 0.5f, cy - gap - len, t, len, white, screen_w,
+                screen_h);
+  AddQuadPixels(vertices, cx - t * 0.5f, cy + gap, t, len, white, screen_w,
+                screen_h);
+
+  char buffer[64];
+  float x = kHudPadding;
+  float y = kHudPadding;
+  const float line_height = (7.0f + 3.0f) * kHudScale;
+
+  std::snprintf(buffer, sizeof(buffer), "FPS:%d", static_cast<int>(g_fps + 0.5f));
+  DrawText(vertices, x, y, kHudScale, buffer, white, screen_w, screen_h);
+  y += line_height;
+
+  const int pos_x = static_cast<int>(std::floor(g_camera.position.x));
+  const int pos_y = static_cast<int>(std::floor(g_camera.position.y));
+  const int pos_z = static_cast<int>(std::floor(g_camera.position.z));
+  std::snprintf(buffer, sizeof(buffer), "X:%d Y:%d Z:%d", pos_x, pos_y, pos_z);
+  DrawText(vertices, x, y, kHudScale, buffer, white, screen_w, screen_h);
+  y += line_height;
+
+  int block_id = -1;
+  if (g_hover_valid &&
+      InBounds(g_hover_hit.block.x, g_hover_hit.block.y, g_hover_hit.block.z)) {
+    block_id = static_cast<int>(
+        g_chunk.Get(g_hover_hit.block.x, g_hover_hit.block.y, g_hover_hit.block.z));
+  }
+  std::snprintf(buffer, sizeof(buffer), "B:%d", block_id);
+  DrawText(vertices, x, y, kHudScale, buffer, white, screen_w, screen_h);
+
+  return vertices;
+}
+
+bool UploadHudMesh(const std::vector<Vertex>& vertices) {
+  if (!g_d3d.device || !g_d3d.context) {
+    return false;
+  }
+  if (vertices.empty()) {
+    g_d3d.hud_vertex_count = 0;
+    return true;
+  }
+  g_d3d.hud_vertex_count = static_cast<UINT>(vertices.size());
+  const UINT byte_size = g_d3d.hud_vertex_count * sizeof(Vertex);
+  if (!g_d3d.hud_vertex_buffer || byte_size > g_d3d.hud_vertex_buffer_size) {
+    g_d3d.hud_vertex_buffer.Reset();
+    D3D11_BUFFER_DESC buffer_desc{};
+    buffer_desc.ByteWidth = byte_size;
+    buffer_desc.Usage = D3D11_USAGE_DYNAMIC;
+    buffer_desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    buffer_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    HRESULT hr = g_d3d.device->CreateBuffer(&buffer_desc, nullptr,
+                                            &g_d3d.hud_vertex_buffer);
+    if (FAILED(hr)) {
+      ShowError("Failed to create HUD vertex buffer", hr);
+      return false;
+    }
+    g_d3d.hud_vertex_buffer_size = byte_size;
+  }
+
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  HRESULT hr = g_d3d.context->Map(g_d3d.hud_vertex_buffer.Get(), 0,
+                                  D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+  if (FAILED(hr)) {
+    ShowError("Failed to map HUD vertex buffer", hr);
+    return false;
+  }
+  std::memcpy(mapped.pData, vertices.data(), byte_size);
+  g_d3d.context->Unmap(g_d3d.hud_vertex_buffer.Get(), 0);
   return true;
 }
 
@@ -1044,6 +1257,26 @@ bool CreatePipeline() {
     return false;
   }
 
+  D3D11_DEPTH_STENCIL_DESC depth_desc{};
+  depth_desc.DepthEnable = TRUE;
+  depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+  depth_desc.DepthFunc = D3D11_COMPARISON_LESS;
+  hr = g_d3d.device->CreateDepthStencilState(&depth_desc, &g_d3d.depth_state);
+  if (FAILED(hr)) {
+    ShowError("Failed to create depth stencil state", hr);
+    return false;
+  }
+
+  depth_desc.DepthEnable = FALSE;
+  depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+  depth_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+  hr = g_d3d.device->CreateDepthStencilState(&depth_desc,
+                                             &g_d3d.depth_state_no_depth);
+  if (FAILED(hr)) {
+    ShowError("Failed to create HUD depth stencil state", hr);
+    return false;
+  }
+
   D3D11_RASTERIZER_DESC wire_desc = raster_desc;
   wire_desc.FillMode = D3D11_FILL_WIREFRAME;
   wire_desc.CullMode = D3D11_CULL_NONE;
@@ -1185,6 +1418,9 @@ void Render() {
   const float clear_color[4] = {0.18f, 0.28f, 0.45f, 1.0f};
   g_d3d.context->OMSetRenderTargets(1, g_d3d.render_target.GetAddressOf(),
                                     g_d3d.depth_stencil_view.Get());
+  if (g_d3d.depth_state) {
+    g_d3d.context->OMSetDepthStencilState(g_d3d.depth_state.Get(), 0);
+  }
   g_d3d.context->ClearRenderTargetView(g_d3d.render_target.Get(), clear_color);
   if (g_d3d.depth_stencil_view) {
     g_d3d.context->ClearDepthStencilView(g_d3d.depth_stencil_view.Get(),
@@ -1238,6 +1474,26 @@ void Render() {
     g_d3d.context->PSSetShader(g_d3d.solid_pixel_shader.Get(), nullptr, 0);
     g_d3d.context->RSSetState(g_d3d.wireframe_state.Get());
     g_d3d.context->Draw(g_d3d.highlight_vertex_count, 0);
+  }
+  if (g_d3d.hud_vertex_buffer && g_d3d.hud_vertex_count > 0 &&
+      g_d3d.solid_pixel_shader && g_d3d.depth_state_no_depth) {
+    const DirectX::XMMATRIX identity = DirectX::XMMatrixIdentity();
+    DirectX::XMFLOAT4X4 mvp_matrix;
+    DirectX::XMStoreFloat4x4(&mvp_matrix, identity);
+    g_d3d.context->UpdateSubresource(g_d3d.constant_buffer.Get(), 0, nullptr,
+                                     &mvp_matrix, 0, 0);
+    g_d3d.context->OMSetDepthStencilState(g_d3d.depth_state_no_depth.Get(), 0);
+    g_d3d.context->IASetInputLayout(g_d3d.input_layout.Get());
+    g_d3d.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_d3d.context->IASetVertexBuffers(
+        0, 1, g_d3d.hud_vertex_buffer.GetAddressOf(), &g_d3d.vertex_stride,
+        &g_d3d.vertex_offset);
+    g_d3d.context->VSSetShader(g_d3d.vertex_shader.Get(), nullptr, 0);
+    g_d3d.context->VSSetConstantBuffers(0, 1,
+                                        g_d3d.constant_buffer.GetAddressOf());
+    g_d3d.context->PSSetShader(g_d3d.solid_pixel_shader.Get(), nullptr, 0);
+    g_d3d.context->RSSetState(g_d3d.rasterizer_state.Get());
+    g_d3d.context->Draw(g_d3d.hud_vertex_count, 0);
   }
   g_d3d.swap_chain->Present(1, 0);
 }
@@ -1329,6 +1585,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR,
       if (dt > 0.1f) {
         dt = 0.1f;
       }
+      UpdateFps(dt);
       UpdateInput(dt);
       UpdateHoverHit();
       const bool changed = HandleBlockInteraction();
@@ -1336,6 +1593,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE, _In_ PWSTR,
         UpdateHoverHit();
       }
       UpdateSelectionMesh();
+      UploadHudMesh(BuildHudMesh());
       Render();
     }
   }

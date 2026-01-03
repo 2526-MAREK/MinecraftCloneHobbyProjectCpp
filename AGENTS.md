@@ -27,16 +27,19 @@ DirectX 11 (native .sln):
 - Crosshair + basic HUD (FPS, position, block ID).
 
 ## Key Files (DX11)
-- `dx11/src/main.cpp`: all DX11 rendering, input, voxel logic, and shaders.
+- `dx11/src/main.cpp`: app entry point + high-level loop.
+- `dx11/src/renderer.cpp`: DirectX 11 device/pipeline, mesh upload, HUD/selection.
+- `dx11/src/world.cpp`: voxel world data, chunk streaming, raycast.
+- `dx11/src/input.cpp`: mouse capture + keyboard/mouse state.
+- `dx11/src/camera.cpp`: FPS camera movement + look.
 - `dx11/MinecraftCloneDX11.sln`: Visual Studio solution.
 - `dx11/MinecraftCloneDX11.vcxproj`: project settings.
 
 ## Next Steps (Suggested)
 1. Load textures from file via PNG + WIC (replace PPM loader).
-2. Separate systems into modules (renderer, world, input, camera).
-3. Implement greedy meshing for fewer triangles.
-4. Add collision, gravity, and basic player controller.
-5. Add chunk LOD or async generation for larger worlds.
+2. Implement greedy meshing for fewer triangles.
+3. Add collision, gravity, and basic player controller.
+4. Add chunk LOD or async generation for larger worlds.
 
 ## Guidelines for Changes
 - Keep DX11 prototype self-contained under `dx11/`.
